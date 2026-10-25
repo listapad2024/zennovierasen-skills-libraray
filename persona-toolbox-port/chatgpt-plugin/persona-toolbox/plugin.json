@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "persona-toolbox",
+  "version": "0.5.0",
+  "description": "Личный RAG Михаила (Persona): кейсы, навыки, стиль, оценка вакансий и ТЗ. Работает локально, API 127.0.0.1:8766.",
+  "author": {
+    "name": "vierasen",
+    "email": "listapad2024@gmail.com"
+  },
+  "license": "MIT",
+  "keywords": ["persona", "rag", "vacancies", "cover-letter"]
+}
