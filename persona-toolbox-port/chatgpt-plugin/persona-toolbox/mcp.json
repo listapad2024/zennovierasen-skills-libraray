@@ -1,0 +1,10 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "persona": {
+      "type": "stdio",
+      "command": "cmd.exe",
+      "args": ["/c", "D:/Persona/mcp_persona_bundle/run_persona_mcp.bat"]
+    }
+  }
+}
