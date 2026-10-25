@@ -1,0 +1,7 @@
+# Добавить в %USERPROFILE%\.codex\config.toml
+# Тот же .bat, что запускает бандл в Claude: он сам читает токен из D:\Persona\client.env.
+[mcp_servers.persona]
+command = "D:\\Persona\\mcp_persona_bundle\\run_persona_mcp.bat"
+startup_timeout_sec = 30
+# persona_analyze ждёт до 600 с, evaluate_vacancy до 300 с.
+tool_timeout_sec = 660
