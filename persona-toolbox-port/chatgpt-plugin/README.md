@@ -16,3 +16,9 @@
 4. Проверка: в чате `/mcp` показывает persona, затем «покажи persona_stats».
 
 Если в `config.toml` уже есть `[mcp_servers.persona]`, его убрать, чтобы не было двух одинаковых серверов. Политику подтверждений переносить в `plugins.persona-toolbox.mcp_servers.persona`.
+
+## Что реально стоит на R9-PC (codex-cli 0.145.0)
+
+Установлено как persona-toolbox@personal 0.5.1 в существующий маркетплейс `%USERPROFILE%\.agents\plugins\marketplace.json` (путь `./plugins/persona-toolbox`, исходник в `%USERPROFILE%\plugins\persona-toolbox`). Формат там проверенный для 0.145: `.codex-plugin/plugin.json` с полями skills и mcpServers плюс `.mcp.json`; вариант из этой папки (plugin.json в корне, mcp.json без точки) на 0.145 не проверялся. Архив для переустановки: `D:\Codex\persona-toolbox-codex-0.5.1.zip`.
+
+Подтверждения для читающих инструментов задаются в `[plugins."persona-toolbox@personal".mcp_servers.persona.tools.<name>]`, `approval_mode = "approve"`.

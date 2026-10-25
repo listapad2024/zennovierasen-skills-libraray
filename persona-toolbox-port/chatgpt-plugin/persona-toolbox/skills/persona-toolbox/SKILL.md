@@ -9,15 +9,15 @@ MCP-сервер `persona` (D:\Persona\mcp_persona_bundle) ходит в Persona
 
 ## Перед первым вызовом
 
-Проверь оба сервиса одной командой PowerShell:
+Проверь сервисы штатным скриптом:
 
 ```powershell
-$q = try { Invoke-RestMethod http://localhost:8333/healthz -TimeoutSec 2 | Out-Null; "ok" } catch { "down" }
-$p = try { (Invoke-RestMethod http://127.0.0.1:8766/health -TimeoutSec 2 -NoProxy).status } catch { "down" }
-"qdrant=$q persona=$p"
+powershell -NoProfile -File D:\Persona\persona_check.ps1
 ```
 
-Если что-то down, подними по D:\Persona\skills\persona-startup-check\SKILL.md (run_qdrant.ps1, run_api.ps1). API грузит bge-m3 20–40 с.
+exit 0 — всё работает. exit 1 — подними, что лежит, по D:\Persona\skills\persona-startup-check\SKILL.md. exit 2 — ничего не трогай, покажи вывод Михаилу.
+
+Не проверяй через `localhost`: он уходит в ::1 и показывает «down» при живом Qdrant, так однажды подняли пустой дубль. Только 127.0.0.1.
 
 ## Какой инструмент брать
 
