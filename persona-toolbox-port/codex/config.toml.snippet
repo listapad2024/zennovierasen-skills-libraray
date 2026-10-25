@@ -1,7 +1,20 @@
 # Добавить в %USERPROFILE%\.codex\config.toml
 # Тот же .bat, что запускает бандл в Claude: он сам читает токен из D:\Persona\client.env.
+# Пути только с прямыми слэшами: с обратными Codex не читает конфиг.
 [mcp_servers.persona]
-command = "D:\\Persona\\mcp_persona_bundle\\run_persona_mcp.bat"
-startup_timeout_sec = 30
+command = "cmd.exe"
+args = ["/c", "D:/Persona/mcp_persona_bundle/run_persona_mcp.bat"]
+startup_timeout_sec = 30.0
 # persona_analyze ждёт до 600 с, evaluate_vacancy до 300 с.
-tool_timeout_sec = 660
+tool_timeout_sec = 660.0
+
+# Без этого codex exec отменяет вызов, ожидая подтверждения.
+# Только читающие; пишущие и тратящие модель остаются с подтверждением.
+[mcp_servers.persona.tools.persona_chat]
+approval_mode = "approve"
+[mcp_servers.persona.tools.persona_stats]
+approval_mode = "approve"
+[mcp_servers.persona.tools.persona_list_recent]
+approval_mode = "approve"
+[mcp_servers.persona.tools.persona_evaluate_vacancy]
+approval_mode = "approve"
