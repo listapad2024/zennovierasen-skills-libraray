@@ -3,7 +3,7 @@
 
 Запуск:  python fl_watch.py            # бесконечный цикл, раз в INTERVAL секунд, только 9:00-21:00 по Минску
          python fl_watch.py --once     # один проход (для проверки)
-Настройки: переменные окружения TG_BOT_TOKEN и TG_CHAT_ID или файл fl_watch.env рядом (KEY=VALUE).
+Настройки: переменные окружения TG_BOT_TOKEN, TG_CHAT_ID и необязательный FL_COOKIE (лента под входом) или файл fl_watch.env рядом (KEY=VALUE).
 Кнопки: «Открыть на FL.ru» и «Сделать отчёт» (задача уходит в queue/, отчет пишет CLI-сессия Claude Code по QUEUE.md и кладет в outbox/).
 Нужен freelance_radar.py в той же папке (парсер ленты FL.ru). Только стандартная библиотека.
 """
@@ -62,6 +62,28 @@ def load_env():
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
+
+
+def use_fl_cookie():
+    """FL_COOKIE в fl_watch.env: лента и страницы заказов FL.ru читаются под входом Михаила (решение 28.10)."""
+    cookie = os.environ.get("FL_COOKIE", "").strip()
+    if not cookie:
+        return
+    plain = fr.get
+
+    def get(url, timeout=25, tries=3):
+        if "fl.ru" not in url:
+            return plain(url, timeout, tries)
+        req = urllib.request.Request(url, headers={"User-Agent": fr.UA, "Accept-Language": "ru,en;q=0.8", "Cookie": cookie})
+        for n in range(tries):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.read().decode("utf-8", "replace")
+            except OSError:
+                if n == tries - 1:
+                    raise
+                time.sleep(2 * (n + 1))
+    fr.get = get
 
 
 def score(v):
@@ -224,6 +246,7 @@ def once():
 
 def main():
     load_env()
+    use_fl_cookie()
     if "--once" in sys.argv:
         print("отправлено:", once())
         return
