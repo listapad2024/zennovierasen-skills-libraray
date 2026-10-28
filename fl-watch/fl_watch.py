@@ -31,6 +31,7 @@ LOG = HERE / "fl_watch.log"
 REPORTS = HERE / "reports"
 QUEUE = HERE / "queue"        # задачи на отчет для CLI-сессии
 OUTBOX = HERE / "outbox"      # готовые отчеты CLI-сессии, скрипт шлет их в Telegram
+TRIAGE = HERE / "triage"      # все свежие заказы без фильтра: CLI-сессия сверяет их с Persona (Михаил 28.10)
 
 # стек Михаила: (вес, шаблон, подпись для причины)
 STACK = [
@@ -50,7 +51,7 @@ MINUS = [
     (-8, r"\b1[сc]\b|битрикс|bitrix|wordpress|вордпресс|tilda|тильд\w*|laravel|\bphp\b|ios|android|flutter|unity|unreal|"
          r"c#|\.net|java\b|дизайн\w*|логотип\w*|верстк\w*|видео|монтаж\w*|\b3d\b|отзыв\w*|накрут\w*|"
          r"учебн\w*|курсов\w*|диплом\w*|\bвуз\w*|блогер\w*|рендер\w*|рендинг\w*|иллюстрац\w*|smm|таргет\w*|\bseo\b|ларавел\w*|\bгта\b|\bмод\b|игров\w*|подписчик\w*|радиолокац\w*|проектн\w* документац\w*", "не стек"),
-    (-30, r"авторег\w*|антидетект|обход\w* (?:защит|cloudflare|капч)|фарм\w*|резидентск\w* прокси|персональн\w* данн\w* физ|stealth|анти-?фрод|добавить контакт\w*", "серое"),
+    (-30, r"авторег\w*|антидетект|обход\w* (?:защит|cloudflare|капч)|фарм\w*|резидентск\w* прокси|персональн\w* данн\w* физ|stealth|анти-?фрод|добавить контакт\w*|доверенн\w* лиц\w*|верификац\w* (?:учетн|аккаунт)\w*|аренд\w* (?:учетн|аккаунт)\w*", "серое"),
 ]
 MINUS = [(w, re.compile(p, re.I), n) for w, p, n in MINUS]
 
@@ -160,6 +161,13 @@ def flush_outbox():
     for f in sorted(OUTBOX.glob("*.md")):
         text = f.read_text(encoding="utf-8")
         reply_to = None
+        if text.startswith("#order="):  # находка сверки с Persona: шлем с кнопками заказа
+            head, _, text = text.partition("\n")
+            oid = head.split("=", 1)[1].strip()
+            url = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}).get("url") if STATE.exists() else None
+            send(text.strip(), url=url, oid=oid if url else None)
+            f.replace(REPORTS / f.name)
+            continue
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
             reply_to = head.split("=", 1)[1].strip() or None
@@ -219,6 +227,12 @@ def once():
         if v["budget"] and v["currency"] in rates:
             v["budget_rub"] = round(v["budget"] * rates[v["currency"]])
         s, why = score(v)
+        if "серое" not in why:
+            TRIAGE.mkdir(exist_ok=True)
+            keep = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind")}
+            keep["score"], keep["why"] = s, why
+            (TRIAGE / f"{v['id'].replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
+            state.setdefault("orders", {})[v["id"]] = {k: keep[k] for k in keep if k not in ("score", "why")}
         if s < THRESHOLD:
             continue
         try:
@@ -233,6 +247,9 @@ def once():
     orders = state.setdefault("orders", {})
     for _, _, v in hits:  # для кнопки «Сделать отчёт»
         orders[v["id"]] = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind")}
+        stale = TRIAGE / f"{v['id'].replace(':', '_')}.json"  # уже ушел напрямую, Persona не нужна
+        if stale.exists():
+            stale.unlink()
     state["orders"] = dict(list(orders.items())[-300:])
     STATE.write_text(json.dumps(state))
     for s, why, v in sorted(hits, key=lambda x: -x[0]):
