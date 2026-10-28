@@ -4,15 +4,13 @@
 Запуск:  python fl_watch.py            # бесконечный цикл, раз в INTERVAL секунд, только 9:00-21:00 по Минску
          python fl_watch.py --once     # один проход (для проверки)
 Настройки: переменные окружения TG_BOT_TOKEN и TG_CHAT_ID или файл fl_watch.env рядом (KEY=VALUE).
-Кнопки: «Открыть на FL.ru» и «Сделать отчёт» (разбор и черновик отклика через claude -p, если Claude Code стоит на ПК).
+Кнопки: «Открыть на FL.ru» и «Сделать отчёт» (задача уходит в queue/, отчет пишет CLI-сессия Claude Code по QUEUE.md и кладет в outbox/).
 Нужен freelance_radar.py в той же папке (парсер ленты FL.ru). Только стандартная библиотека.
 """
 import datetime as dt
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -31,9 +29,8 @@ THRESHOLD = 5                 # порог «стоящего» заказа
 STATE = HERE / "fl_watch_state.json"
 LOG = HERE / "fl_watch.log"
 REPORTS = HERE / "reports"
-RATE_RUB_H = 1600             # ставка Михаила на FL.ru
-PAY_LINE = ("По оплате: откликаюсь на карту физлица, но при необходимости работаем по безопасной сделке FL.ru "
-            "и можем оформить через юрлицо/бухгалтерию.")
+QUEUE = HERE / "queue"        # задачи на отчет для CLI-сессии
+OUTBOX = HERE / "outbox"      # готовые отчеты CLI-сессии, скрипт шлет их в Telegram
 
 # стек Михаила: (вес, шаблон, подпись для причины)
 STACK = [
@@ -112,26 +109,9 @@ def send(text, url=None, oid=None, reply_to=None):
     tg("sendMessage", **p)
 
 
-def draft_with_claude(v, why):
-    """Черновик отклика через Claude Code на этом ПК (claude -p). Нет CLI или ошибка = None."""
-    exe = shutil.which("claude")
-    if not exe:
-        return None
-    prompt = (f"Заказ на FL.ru.\nЗаголовок: {v['title']}\nБюджет: {v.get('budget_rub') or 'не указан'} руб.\n"
-              f"ТЗ: {v['text'][:3000]}\n\nЯ Михаил, 11 лет в автоматизации и парсинге, Python, AI-агенты и LLM, "
-              f"Telegram-боты, ClickHouse. Совпадение со стеком: {', '.join(why)}.\n"
-              f"Ответь по-русски, без markdown: 1) суть заказа в 2 предложениях; 2) риски и что уточнить; "
-              f"3) оценка в часах и цена по {RATE_RUB_H} руб/ч, не выше бюджета заказчика, срок с учетом основной работы 5 ч/день; "
-              f"4) черновик отклика: коротко, по делу, без «—», без «!», «е» вместо «ё», без подписи, "
-              f"заверши строкой: {PAY_LINE} Опыт не выдумывай, где нужен кейс с цифрами, поставь [ВПИСАТЬ].")
-    try:
-        r = subprocess.run([exe, "-p", prompt], capture_output=True, text=True, encoding="utf-8", timeout=240)
-        return r.stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def report(oid, reply_to):
+def enqueue(oid, reply_to):
+    """Кнопка «Сделать отчёт»: кладем задачу в queue/. Отчет пишет отдельная CLI-сессия Claude Code по QUEUE.md,
+    сам скрипт к Claude не обращается (решение Михаила 28.10)."""
     state = json.loads(STATE.read_text()) if STATE.exists() else {}
     v = state.get("orders", {}).get(oid)
     if not v:
@@ -143,16 +123,26 @@ def report(oid, reply_to):
             return
     except OSError:
         pass
-    s, why = score(v)
-    body = draft_with_claude(v, why) or (
-        f"Черновик не собран: Claude Code на ПК недоступен. ТЗ:\n{v['text'][:2500]}")
-    b = f"{v['budget_rub']:,} ₽".replace(",", " ") if v.get("budget_rub") else "бюджет не указан"
-    text = (f"Отчёт: {v['title'][:120]}\nОценка {s}: {', '.join(why)}\n{b} · {v.get('responses') or 0} откл · "
-            f"безопасная сделка: {'да' if v.get('safe_deal') else 'нет'}\n{v['url']}\n\n{body}\n\n"
-            f"Отклик не отправлен. Напиши в треде радара «отправь» с этим заказом.")
+    v["score"], v["why"] = score(v)
+    v["reply_to"] = reply_to
+    QUEUE.mkdir(exist_ok=True)
+    (QUEUE / f"{oid.replace(':', '_')}.json").write_text(json.dumps(v, ensure_ascii=False, indent=1), encoding="utf-8")
+    send("Заказ в очереди на отчёт.", reply_to=reply_to)
+
+
+def flush_outbox():
+    """Готовые отчеты CLI-сессии (outbox/*.md, первая строка #reply_to=N) уходят в Telegram, файл переезжает в reports/."""
+    if not OUTBOX.exists():
+        return
     REPORTS.mkdir(exist_ok=True)
-    (REPORTS / f"{dt.datetime.now(MINSK):%Y-%m-%d_%H%M}_{oid.replace(':', '_')}.md").write_text(text, encoding="utf-8")
-    send(text, reply_to=reply_to)
+    for f in sorted(OUTBOX.glob("*.md")):
+        text = f.read_text(encoding="utf-8")
+        reply_to = None
+        if text.startswith("#reply_to="):
+            head, _, text = text.partition("\n")
+            reply_to = head.split("=", 1)[1].strip() or None
+        send(text.strip() + "\n\nОтклик не отправлен. Напиши в треде радара «отправь» с этим заказом.", reply_to=reply_to)
+        f.replace(REPORTS / f.name)
 
 
 def poll(until):
@@ -163,7 +153,11 @@ def poll(until):
     off = None
     while time.time() < until:
         try:
-            upd = tg("getUpdates", timeout=min(25, max(1, int(until - time.time()))),
+            flush_outbox()
+        except Exception:
+            pass
+        try:
+            upd = tg("getUpdates", timeout=min(20, max(1, int(until - time.time()))),
                      allowed_updates=["callback_query"], **({"offset": off} if off else {}))
         except Exception:  # сеть или 409 от другого читателя бота: ждем и пробуем снова
             time.sleep(10)
@@ -175,9 +169,9 @@ def poll(until):
                 continue
             if str(cq["message"]["chat"]["id"]) != str(os.environ.get("TG_CHAT_ID")):
                 continue  # чужие чаты не обслуживаем
-            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Собираю отчёт")
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Ставлю в очередь")
             try:
-                report(cq["data"][2:], cq["message"]["message_id"])
+                enqueue(cq["data"][2:], cq["message"]["message_id"])
             except Exception as e:
                 send(f"Отчёт не собрался: {type(e).__name__}", reply_to=cq["message"]["message_id"])
 
