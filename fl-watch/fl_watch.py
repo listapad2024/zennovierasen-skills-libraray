@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""FL Watch: каждые 5 минут смотрит свежую ленту FL.ru, оценивает заказ по стеку Михаила и шлет стоящие в Telegram.
+"""FL Watch: каждые 5 минут смотрит свежую ленту FL.ru и кладет новые заказы в triage/ для CLI-сессии Claude Code.
+Claude оценивает их по QUEUE.md и кладет подходящие в outbox/ md-файлом (оценка + варианты отклика),
+скрипт шлет эти файлы документом в Telegram. Мусор не шлется, на FL.ru ничего не отправляется (решение 28.10).
 
 Запуск:  python fl_watch.py            # бесконечный цикл, раз в INTERVAL секунд, только 9:00-21:00 по Минску
          python fl_watch.py --once     # один проход (для проверки)
 Настройки: переменные окружения TG_BOT_TOKEN, TG_CHAT_ID и необязательный FL_COOKIE (лента под входом) или файл fl_watch.env рядом (KEY=VALUE).
-Кнопки: «Открыть на FL.ru» и «Сделать отчёт» (задача уходит в queue/, отчет пишет CLI-сессия Claude Code по QUEUE.md и кладет в outbox/).
 Нужен freelance_radar.py в той же папке (парсер ленты FL.ru). Только стандартная библиотека.
 """
 import datetime as dt
@@ -25,7 +26,6 @@ INTERVAL = 300
 WORK_HOURS = (9, 21)          # по Минску (решение Михаила 27.10)
 MINSK = dt.timezone(dt.timedelta(hours=3))
 MAX_AGE_H = 3                 # старше не смотрим: хорошие заказы закрываются за часы
-THRESHOLD = 5                 # порог «стоящего» заказа
 STATE = HERE / "fl_watch_state.json"
 LOG = HERE / "fl_watch.log"
 REPORTS = HERE / "reports"
@@ -177,12 +177,16 @@ def flush_outbox():
     for f in sorted(OUTBOX.glob("*.md")):
         text = f.read_text(encoding="utf-8")
         reply_to = None
-        if text.startswith("#order="):  # находка сверки с Persona: шлем с кнопками заказа
+        if text.startswith("#order="):  # оцененный Claude заказ: md-файл документом, в подписи заказ и ссылка
             head, _, text = text.partition("\n")
             oid = head.split("=", 1)[1].strip()
-            url = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}).get("url") if STATE.exists() else None
-            send(text.strip(), url=url, oid=oid if url else None)
-            f.replace(REPORTS / f.name)
+            o = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}) if STATE.exists() else {}
+            dest = REPORTS / f.name
+            dest.write_text(text.strip() + "\n", encoding="utf-8")
+            f.unlink()
+            lines = [l.strip("# ").strip() for l in text.strip().splitlines() if l.strip()]
+            cap = "\n".join(lines[:3]) + (f"\n{o['url']}" if o.get("url") else "")
+            send_doc(dest, cap + "\nОткликаешься сам на FL.ru, бот ничего не отправляет.")
             continue
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
@@ -226,6 +230,8 @@ def poll(until):
 
 
 def once():
+    """Новые заказы ленты: серые и занятые отсекаем, остальные в triage\\ для CLI-сессии Claude.
+    Сам скрипт в Telegram заказы не шлет (решение Михаила 28.10: только оцененные Claude, без мусора)."""
     state = json.loads(STATE.read_text()) if STATE.exists() else {"seen": []}
     seen = set(state["seen"])
     sent = set(json.loads((HERE / "sent.json").read_text())) if (HERE / "sent.json").exists() else set()
@@ -234,7 +240,8 @@ def once():
     rates = fr.rates()
     out = {}
     fr.fl_parse(fr.get("https://www.fl.ru/projects/?kind=1"), out, now)
-    hits = []
+    orders = state.setdefault("orders", {})
+    queued = 0
     for v in out.values():
         if v["id"] in seen or v["id"] in sent:
             continue
@@ -245,46 +252,35 @@ def once():
                 continue
         if v["budget"] and v["currency"] in rates:
             v["budget_rub"] = round(v["budget"] * rates[v["currency"]])
-        s, why = score(v)
-        if "серое" not in why:
-            TRIAGE.mkdir(exist_ok=True)
-            keep = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind")}
-            keep["score"], keep["why"] = s, why
-            (TRIAGE / f"{v['id'].replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
-            state.setdefault("orders", {})[v["id"]] = {k: keep[k] for k in keep if k not in ("score", "why")}
-        if s < THRESHOLD:
+        if "серое" in score(v)[1]:
             continue
         try:
-            if fr.fl_details(v) == "taken":
+            if fr.fl_details(v) == "taken":  # полное ТЗ и проверка, не выбран ли исполнитель
                 continue
-            s, why = score(v)  # переоценка по полному ТЗ
         except OSError:
             pass
-        if s >= THRESHOLD:
-            hits.append((s, why, v))
+        s, why = score(v)
+        if "серое" in why:
+            continue
+        keep = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind", "safe_deal")}
+        keep["score"], keep["why"] = s, why
+        TRIAGE.mkdir(exist_ok=True)
+        (TRIAGE / f"{v['id'].replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
+        orders[v["id"]] = {k: keep[k] for k in ("id", "title", "url", "budget_rub")}
+        queued += 1
     state["seen"] = sorted(seen)[-5000:]
-    orders = state.setdefault("orders", {})
-    for _, _, v in hits:  # для кнопки «Сделать отчёт»
-        orders[v["id"]] = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind")}
-        stale = TRIAGE / f"{v['id'].replace(':', '_')}.json"  # уже ушел напрямую, Persona не нужна
-        if stale.exists():
-            stale.unlink()
     state["orders"] = dict(list(orders.items())[-300:])
     STATE.write_text(json.dumps(state))
-    for s, why, v in sorted(hits, key=lambda x: -x[0]):
-        b = f"{v['budget_rub']:,} ₽".replace(",", " ") if v.get("budget_rub") else "бюджет не указан"
-        send(f"FL: {v['title'][:120]}\nОценка {s}: {', '.join(why)}\n{b} · {v.get('responses') or 0} откл · "
-             f"{v.get('age_h')} ч назад\n{v['text'][:300]}\n{v['url']}", url=v["url"], oid=v["id"])
     with LOG.open("a", encoding="utf-8") as f:
-        f.write(f"{now:%Y-%m-%d %H:%M} лента {len(out)}, отправлено {len(hits)}\n")
-    return len(hits)
+        f.write(f"{now:%Y-%m-%d %H:%M} лента {len(out)}, в triage {queued}\n")
+    return queued
 
 
 def main():
     load_env()
     use_fl_cookie()
     if "--once" in sys.argv:
-        print("отправлено:", once())
+        print("в triage:", once())
         return
     while True:
         start = time.time()
