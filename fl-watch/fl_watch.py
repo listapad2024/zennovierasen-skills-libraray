@@ -132,6 +132,22 @@ def send(text, url=None, oid=None, reply_to=None):
     tg("sendMessage", **p)
 
 
+def send_doc(path, caption, reply_to=None):
+    """md-файл с вариантами отклика документом в Telegram: Михаил открывает и отправляет отклик сам (решение 28.10)."""
+    tok, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
+    if not (tok and chat):
+        print(caption, path)
+        return
+    b = "flwatch" + str(int(time.time() * 1000))
+    parts = [("chat_id", chat), ("caption", caption[:1000])] + ([("reply_to_message_id", str(reply_to))] if reply_to else [])
+    body = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode() for k, v in parts)
+    body += (f"--{b}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{Path(path).name}\"\r\n"
+             f"Content-Type: text/markdown\r\n\r\n").encode() + Path(path).read_bytes() + f"\r\n--{b}--\r\n".encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendDocument", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+    urllib.request.urlopen(req, timeout=60).read()
+
+
 def enqueue(oid, reply_to):
     """Кнопка «Сделать отчёт»: кладем задачу в queue/. Отчет пишет отдельная CLI-сессия Claude Code по QUEUE.md,
     сам скрипт к Claude не обращается (решение Михаила 28.10)."""
@@ -171,8 +187,11 @@ def flush_outbox():
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
             reply_to = head.split("=", 1)[1].strip() or None
-        send(text.strip() + "\n\nОтклик не отправлен. Напиши в треде радара «отправь» с этим заказом.", reply_to=reply_to)
-        f.replace(REPORTS / f.name)
+        dest = REPORTS / f.name
+        dest.write_text(text.strip() + "\n", encoding="utf-8")
+        f.unlink()
+        first = text.strip().splitlines()[0][:200] if text.strip() else f.name
+        send_doc(dest, f"Отчёт и варианты отклика: {first}\nОткликаешься сам на FL.ru, бот ничего не отправляет.", reply_to=reply_to)
 
 
 def poll(until):
