@@ -202,6 +202,19 @@ def sweep_triage():
             f.replace(TRIAGE / "stale" / f.name)
 
 
+def order_caption(text, o):
+    """Подпись как у облачного прогона (Михаил 29.10, один формат): заголовок: бюджет или наша оценка, срок, отклики, ссылка."""
+    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+    title = next((l.lstrip("# ").strip() for l in lines if l.startswith("# ")), o.get("title") or "Заказ FL.ru")
+    total = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("итог:")), "")
+    rub = o.get("budget_rub")
+    parts = [f"бюджет {rub:,} ₽".replace(",", " ") if rub else "", f"наша оценка {total}" if total else ""]
+    if o.get("responses") is not None:
+        parts.append(f"{o['responses']} откл")
+    cap = f"{title}: " + ", ".join(p for p in parts if p)
+    return cap + (f"\n{o['url']}" if o.get("url") else "") + "\nОткликаешься сам на FL.ru, бот ничего не отправляет."
+
+
 def flush_outbox():
     """Готовые отчеты CLI-сессии (outbox/*.md, первая строка #reply_to=N) уходят в Telegram, файл переезжает в reports/."""
     if not OUTBOX.exists():
@@ -217,9 +230,7 @@ def flush_outbox():
             dest = REPORTS / f.name
             dest.write_text(text.strip() + "\n", encoding="utf-8")
             f.unlink()
-            lines = [l.strip("# ").strip() for l in text.strip().splitlines() if l.strip()]
-            cap = "\n".join(lines[:3]) + (f"\n{o['url']}" if o.get("url") else "")
-            send_doc(dest, cap + "\nОткликаешься сам на FL.ru, бот ничего не отправляет.")
+            send_doc(dest, order_caption(text, o))
             continue
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
@@ -301,7 +312,7 @@ def once():
         keep["persona"] = persona_hits(v)
         TRIAGE.mkdir(exist_ok=True)
         (TRIAGE / f"{v['id'].replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
-        orders[v["id"]] = {k: keep[k] for k in ("id", "title", "url", "budget_rub")}
+        orders[v["id"]] = {k: keep[k] for k in ("id", "title", "url", "budget_rub", "responses")}
         queued += 1
     state["seen"] = sorted(seen)[-5000:]
     state["orders"] = dict(list(orders.items())[-300:])
