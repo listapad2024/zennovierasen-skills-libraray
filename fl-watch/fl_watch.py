@@ -217,6 +217,19 @@ def order_caption(text, o):
     return cap + (f"\n{o['url']}" if o.get("url") else "") + "\nОткликаешься сам на FL.ru, бот ничего не отправляет."
 
 
+def deliver(src, dest, caption, reply_to=None):
+    """Отправка документа с записью в лог; при ошибке файл остается в outbox и уйдет на следующем круге (29.10: ошибки молча терялись)."""
+    try:
+        send_doc(dest, caption, reply_to=reply_to)
+        msg, ok = f"отправлен {dest.name}", True
+    except Exception as e:
+        body = e.read().decode("utf-8", "replace")[:200] if hasattr(e, "read") else ""
+        msg, ok = f"ОШИБКА отправки {src.name}: {type(e).__name__} {body}", False
+    with LOG.open("a", encoding="utf-8") as lg:
+        lg.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} {msg}\n")
+    return ok
+
+
 def flush_outbox():
     """Готовые отчеты CLI-сессии (outbox/*.md, первая строка #reply_to=N) уходят в Telegram, файл переезжает в reports/."""
     if not OUTBOX.exists():
@@ -231,17 +244,17 @@ def flush_outbox():
             o = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}) if STATE.exists() else {}
             dest = REPORTS / f.name
             dest.write_text(text.strip() + "\n", encoding="utf-8")
-            f.unlink()
-            send_doc(dest, order_caption(text, o))
+            if deliver(f, dest, order_caption(text, o)):
+                f.unlink()
             continue
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
             reply_to = head.split("=", 1)[1].strip() or None
         dest = REPORTS / f.name
         dest.write_text(text.strip() + "\n", encoding="utf-8")
-        f.unlink()
         first = text.strip().splitlines()[0][:200] if text.strip() else f.name
-        send_doc(dest, f"Отчёт и варианты отклика: {first}\nОткликаешься сам на FL.ru, бот ничего не отправляет.", reply_to=reply_to)
+        if deliver(f, dest, f"Отчёт и варианты отклика: {first}\nОткликаешься сам на FL.ru, бот ничего не отправляет.", reply_to):
+            f.unlink()
 
 
 def poll(until):
