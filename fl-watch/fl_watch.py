@@ -63,7 +63,7 @@ MINUS = [(w, re.compile(p, re.I), n) for w, p, n in MINUS]
 def load_env():
     f = HERE / "fl_watch.env"
     if f.exists():
-        for line in f.read_text(encoding="utf-8").splitlines():
+        for line in f.read_text(encoding="utf-8-sig").splitlines():
             if "=" in line and not line.lstrip().startswith("#"):
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip())
