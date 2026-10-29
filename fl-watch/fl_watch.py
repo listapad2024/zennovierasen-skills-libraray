@@ -205,7 +205,7 @@ def sweep_triage():
 
 
 def order_caption(text, o):
-    """Подпись как у облачного прогона (Михаил 29.10, один формат): заголовок: бюджет или наша оценка, срок, отклики, ссылка."""
+    """Короткая подпись к md-файлу: заголовок, бюджет или наша оценка, отклики (лимит подписи 1024 символа)."""
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     title = next((l.lstrip("# ").strip() for l in lines if l.startswith("# ")), o.get("title") or "Заказ FL.ru")
     total = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("итог:")), "")
@@ -213,13 +213,28 @@ def order_caption(text, o):
     parts = [f"бюджет {rub:,} ₽".replace(",", " ") if rub else "", f"наша оценка {total}" if total else ""]
     if o.get("responses") is not None:
         parts.append(f"{o['responses']} откл")
-    cap = f"{title}: " + ", ".join(p for p in parts if p)
-    return cap + (f"\n{o['url']}" if o.get("url") else "") + "\nОткликаешься сам на FL.ru, бот ничего не отправляет."
+    return f"{title}: " + ", ".join(p for p in parts if p)
 
 
-def deliver(src, dest, caption, reply_to=None):
+def order_message(text, o):
+    """Михаил 29.10: оценка и стоимость полностью, как в md, блоки через пустую строку. Идет сообщением перед файлом."""
+    body = text.strip()
+    head, _, rest = body.partition("## Оценка")
+    est = rest.split("\n## ", 1)[0].strip() if rest else ""
+    hl = [l.strip() for l in head.splitlines() if l.strip()]
+    title = next((l.lstrip("# ").strip() for l in hl if l.startswith("# ")), o.get("title") or "Заказ FL.ru")
+    meta = [l for l in hl if not l.startswith("# ") and not l.startswith("http")]
+    est = re.sub(r"\n{3,}", "\n\n", re.sub(r"(?m)^(\S[^\n]*)\n(?=\S)", r"\1\n\n", est))  # абзацы через пустую строку
+    blocks = [title, "\n\n".join(meta), "Оценка\n\n" + est if est else "", o.get("url") or "",
+              "Варианты отклика в файле ниже. Откликаешься сам на FL.ru, бот ничего не отправляет."]
+    return "\n\n".join(b for b in blocks if b)[:4000]
+
+
+def deliver(src, dest, caption, reply_to=None, message=None):
     """Отправка документа с записью в лог; при ошибке файл остается в outbox и уйдет на следующем круге (29.10: ошибки молча терялись)."""
     try:
+        if message:
+            send(message)
         send_doc(dest, caption, reply_to=reply_to)
         msg, ok = f"отправлен {dest.name}", True
     except Exception as e:
@@ -244,7 +259,7 @@ def flush_outbox():
             o = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}) if STATE.exists() else {}
             dest = REPORTS / f.name
             dest.write_text(text.strip() + "\n", encoding="utf-8")
-            if deliver(f, dest, order_caption(text, o)):
+            if deliver(f, dest, order_caption(text, o), message=order_message(text, o)):
                 f.unlink()
             continue
         if text.startswith("#reply_to="):
