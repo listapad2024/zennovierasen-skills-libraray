@@ -32,6 +32,10 @@ REPORTS = HERE / "reports"
 QUEUE = HERE / "queue"        # задачи на отчет для CLI-сессии
 OUTBOX = HERE / "outbox"      # готовые отчеты CLI-сессии, скрипт шлет их в Telegram
 TRIAGE = HERE / "triage"      # все свежие заказы без фильтра: CLI-сессия сверяет их с Persona (Михаил 28.10)
+VERDICT = HERE / "verdict"    # CLI-сессия пишет сюда <имя>.txt (ok/skip), скрипт по нему убирает заказ из очереди
+STALE_H = 4                   # заказ старше этого без решения уже неинтересен: в triage/stale
+PERSONA_URL = "http://127.0.0.1:8766/retrieve"
+PERSONA_ENV = Path(os.environ.get("PERSONA_ENV", r"D:\Persona\client.env"))
 
 # стек Михаила: (вес, шаблон, подпись для причины)
 STACK = [
@@ -169,6 +173,35 @@ def enqueue(oid, reply_to):
     send("Заказ в очереди на отчёт.", reply_to=reply_to)
 
 
+def persona_hits(v):
+    """Похожие кейсы из Persona для CLI-сессии: сессии тогда хватает чтения и записи файлов, без shell."""
+    try:
+        tok = next((l.split("=", 1)[1].strip() for l in PERSONA_ENV.read_text(encoding="utf-8").splitlines()
+                    if l.split("=", 1)[0].strip().upper().endswith("TOKEN")), "")
+        body = json.dumps({"query": f"{v['title']}. {v['text'][:500]}", "top_k": 5}).encode()
+        req = urllib.request.Request(PERSONA_URL, data=body, headers={"Content-Type": "application/json", "X-API-Token": tok})
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))  # localhost мимо прокси
+        with opener.open(req, timeout=30) as r:
+            return r.read().decode("utf-8", "replace")[:3000]
+    except Exception as e:
+        return f"Persona недоступна: {type(e).__name__}"
+
+
+def sweep_triage():
+    """Решения CLI-сессии (verdict/*.txt) убирают заказ в triage/done, заказы без решения дольше STALE_H часов в triage/stale."""
+    if not TRIAGE.exists():
+        return
+    for sub in ("done", "stale"):
+        (TRIAGE / sub).mkdir(exist_ok=True)
+    for f in TRIAGE.glob("*.json"):
+        vd = VERDICT / (f.stem + ".txt")
+        if vd.exists():
+            f.replace(TRIAGE / "done" / f.name)
+            vd.unlink()
+        elif time.time() - f.stat().st_mtime > STALE_H * 3600:
+            f.replace(TRIAGE / "stale" / f.name)
+
+
 def flush_outbox():
     """Готовые отчеты CLI-сессии (outbox/*.md, первая строка #reply_to=N) уходят в Telegram, файл переезжает в reports/."""
     if not OUTBOX.exists():
@@ -206,6 +239,7 @@ def poll(until):
     off = None
     while time.time() < until:
         try:
+            sweep_triage()
             flush_outbox()
         except Exception:
             pass
@@ -264,6 +298,7 @@ def once():
             continue
         keep = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind", "safe_deal")}
         keep["score"], keep["why"] = s, why
+        keep["persona"] = persona_hits(v)
         TRIAGE.mkdir(exist_ok=True)
         (TRIAGE / f"{v['id'].replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
         orders[v["id"]] = {k: keep[k] for k in ("id", "title", "url", "budget_rub")}
