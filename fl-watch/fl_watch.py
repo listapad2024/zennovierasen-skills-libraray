@@ -205,62 +205,67 @@ def sweep_triage():
 
 
 def order_caption(text, o):
-    """Короткая подпись к md-файлу: заголовок, бюджет или наша оценка, отклики (лимит подписи 1024 символа)."""
+    """Михаил 29.10 (вечер): на заказ одна подпись: заголовок, один абзац о чем заказ и почему хороший, ссылка. Подробности только в md."""
     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
     title = next((l.lstrip("# ").strip() for l in lines if l.startswith("# ")), o.get("title") or "Заказ FL.ru")
-    total = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("итог:")), "")
-    rub = o.get("budget_rub")
-    parts = [f"бюджет {rub:,} ₽".replace(",", " ") if rub else "", f"наша оценка {total}" if total else ""]
-    if o.get("responses") is not None:
-        parts.append(f"{o['responses']} откл")
-    return f"{title}: " + ", ".join(p for p in parts if p)
+    short = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("кратко:")), "")
+    if not short:  # старые md без строки «Кратко:»
+        short = next((l.split(":", 1)[1].strip() for l in lines if l.lower().lstrip("-* ").startswith("чем подходит:")), "")
+        total = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("итог:")), "")
+        short = " ".join(x for x in (short, f"Оценка {total}." if total else "") if x)
+    cap = "\n\n".join(x for x in (title, short, o.get("url") or "") if x)
+    return cap[:1000]
 
 
-def order_message(text, o):
-    """Михаил 29.10: оценка и стоимость полностью, как в md, блоки через пустую строку. Идет сообщением перед файлом."""
-    body = text.strip()
-    head, _, rest = body.partition("## Оценка")
-    est = rest.split("\n## ", 1)[0].strip() if rest else ""
-    hl = [l.strip() for l in head.splitlines() if l.strip()]
-    title = next((l.lstrip("# ").strip() for l in hl if l.startswith("# ")), o.get("title") or "Заказ FL.ru")
-    meta = [l for l in hl if not l.startswith("# ") and not l.startswith("http")]
-    est = re.sub(r"\n{3,}", "\n\n", re.sub(r"(?m)^(\S[^\n]*)\n(?=\S)", r"\1\n\n", est))  # абзацы через пустую строку
-    blocks = [title, "\n\n".join(meta), "Оценка\n\n" + est if est else "", o.get("url") or "",
-              "Варианты отклика в файле ниже. Откликаешься сам на FL.ru, бот ничего не отправляет."]
-    return "\n\n".join(b for b in blocks if b)[:4000]
+def send_group(items):
+    """Несколько заказов одним блоком (sendMediaGroup, до 10 файлов), у каждого файла своя подпись."""
+    tok, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
+    if not (tok and chat):
+        for dest, cap in items:
+            print(cap, dest)
+        return
+    b = "flwatch" + str(int(time.time() * 1000))
+    media = [{"type": "document", "media": f"attach://f{i}", "caption": cap} for i, (_, cap) in enumerate(items)]
+    body = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode()
+                    for k, v in (("chat_id", chat), ("media", json.dumps(media, ensure_ascii=False))))
+    for i, (dest, _) in enumerate(items):
+        body += (f"--{b}\r\nContent-Disposition: form-data; name=\"f{i}\"; filename=\"{Path(dest).name}\"\r\n"
+                 f"Content-Type: text/markdown\r\n\r\n").encode() + Path(dest).read_bytes() + b"\r\n"
+    body += f"--{b}--\r\n".encode()
+    req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendMediaGroup", data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={b}"})
+    urllib.request.urlopen(req, timeout=90).read()
 
 
-def deliver(src, dest, caption, reply_to=None, message=None):
-    """Отправка документа с записью в лог; при ошибке файл остается в outbox и уйдет на следующем круге (29.10: ошибки молча терялись)."""
+def deliver(names, fn):
+    """Отправка с записью в лог; при ошибке файлы остаются в outbox и уйдут на следующем круге (29.10: ошибки молча терялись)."""
     try:
-        if message:
-            send(message)
-        send_doc(dest, caption, reply_to=reply_to)
-        msg, ok = f"отправлен {dest.name}", True
+        fn()
+        msg, ok = f"отправлен {', '.join(names)}", True
     except Exception as e:
         body = e.read().decode("utf-8", "replace")[:200] if hasattr(e, "read") else ""
-        msg, ok = f"ОШИБКА отправки {src.name}: {type(e).__name__} {body}", False
+        msg, ok = f"ОШИБКА отправки {', '.join(names)}: {type(e).__name__} {body}", False
     with LOG.open("a", encoding="utf-8") as lg:
         lg.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} {msg}\n")
     return ok
 
 
 def flush_outbox():
-    """Готовые отчеты CLI-сессии (outbox/*.md, первая строка #reply_to=N) уходят в Telegram, файл переезжает в reports/."""
+    """Готовые отчеты CLI-сессии уходят в Telegram, файл переезжает в reports/. Заказы одного круга идут одним блоком."""
     if not OUTBOX.exists():
         return
     REPORTS.mkdir(exist_ok=True)
+    orders = []
     for f in sorted(OUTBOX.glob("*.md")):
         text = f.read_text(encoding="utf-8")
         reply_to = None
-        if text.startswith("#order="):  # оцененный Claude заказ: md-файл документом, в подписи заказ и ссылка
+        if text.startswith("#order="):  # оцененный Claude заказ: md-файл документом, подпись из строки «Кратко:» и ссылка
             head, _, text = text.partition("\n")
             oid = head.split("=", 1)[1].strip()
             o = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}) if STATE.exists() else {}
             dest = REPORTS / f.name
             dest.write_text(text.strip() + "\n", encoding="utf-8")
-            if deliver(f, dest, order_caption(text, o), message=order_message(text, o)):
-                f.unlink()
+            orders.append((f, dest, order_caption(text, o)))
             continue
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
@@ -268,8 +273,18 @@ def flush_outbox():
         dest = REPORTS / f.name
         dest.write_text(text.strip() + "\n", encoding="utf-8")
         first = text.strip().splitlines()[0][:200] if text.strip() else f.name
-        if deliver(f, dest, f"Отчёт и варианты отклика: {first}\nОткликаешься сам на FL.ru, бот ничего не отправляет.", reply_to):
+        cap = f"Отчёт и варианты отклика: {first}\n\nОткликаешься сам на FL.ru, бот ничего не отправляет."
+        if deliver([f.name], lambda: send_doc(dest, cap, reply_to=reply_to)):
             f.unlink()
+    for i in range(0, len(orders), 10):
+        chunk = orders[i:i + 10]
+        if len(chunk) == 1:
+            fn = lambda c=chunk[0]: send_doc(c[1], c[2])
+        else:
+            fn = lambda c=chunk: send_group([(d, cap) for _, d, cap in c])
+        if deliver([f.name for f, _, _ in chunk], fn):
+            for f, _, _ in chunk:
+                f.unlink()
 
 
 def poll(until):
