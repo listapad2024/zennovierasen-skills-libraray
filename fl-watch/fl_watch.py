@@ -196,6 +196,8 @@ def sweep_triage():
     for f in TRIAGE.glob("*.json"):
         vd = VERDICT / (f.stem + ".txt")
         if vd.exists():
+            with LOG.open("a", encoding="utf-8") as lg:  # решение с причиной остается в логе, verdict-файл удаляется
+                lg.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} verdict {f.stem}: {vd.read_text(encoding='utf-8', errors='replace').strip()[:300]}\n")
             f.replace(TRIAGE / "done" / f.name)
             vd.unlink()
         elif time.time() - f.stat().st_mtime > STALE_H * 3600:
