@@ -367,21 +367,75 @@ def once():
     return queued
 
 
+ALERTS = HERE / "fl_alerts.json"  # когда какой алерт уже слали, чтобы не спамить
+
+
+def alert(key, text, every_h=2):
+    """Михаил 30.10: если цепочка встала, бот сам говорит об этом (не чаще раза в every_h часов на ключ)."""
+    try:
+        st = json.loads(ALERTS.read_text()) if ALERTS.exists() else {}
+    except Exception:
+        st = {}
+    if time.time() - st.get(key, 0) < every_h * 3600:
+        return
+    st[key] = time.time()
+    ALERTS.write_text(json.dumps(st))
+    try:
+        send("⚠️ FL-радар: " + text)
+    except Exception:
+        pass
+    with LOG.open("a", encoding="utf-8") as f:
+        f.write(f"{dt.datetime.now(MINSK):%Y-%m-%d %H:%M} алерт {key}: {text}\n")
+
+
+def health(errors_in_row):
+    """Проверки внутри FL Watch: оценка не разбирает очередь, лента не читается."""
+    q = list(TRIAGE.glob("*.json")) if TRIAGE.exists() else []
+    if q:
+        age = (time.time() - min(f.stat().st_mtime for f in q)) / 60
+        if age > 30:
+            alert("triage", f"оценка заказов не идет, в очереди {len(q)}, самый старый ждет {age:.0f} мин. "
+                            "Проверь задачу FL-Triage в планировщике.")
+    if errors_in_row >= 3:
+        alert("feed", f"лента FL.ru не читается {errors_in_row} круга подряд, подробности в fl_watch.log.")
+
+
+def check_watch():
+    """Запускается из fl_triage.cmd: если сам FL Watch молчит, пишем в бот и перезапускаем его."""
+    now = dt.datetime.now(MINSK)
+    if not (WORK_HOURS[0] <= now.hour < WORK_HOURS[1]) or (now.hour == WORK_HOURS[0] and now.minute < 30) or not LOG.exists():
+        return  # до 9:30 лог еще вчерашний, это не сбой
+    idle = (time.time() - LOG.stat().st_mtime) / 60
+    if idle > 20:
+        alert("watch", f"FL Watch молчит {idle:.0f} мин, перезапускаю задачу FL-Watch. Если сообщение повторится, ПК надо проверить.")
+        os.system('schtasks /Run /TN "FL-Watch" >nul 2>&1')
+
+
 def main():
     load_env()
     use_fl_cookie()
     if "--once" in sys.argv:
         print("в triage:", once())
         return
+    if "--check" in sys.argv:
+        check_watch()
+        return
+    errors = 0
     while True:
         start = time.time()
         h = dt.datetime.now(MINSK).hour
         if WORK_HOURS[0] <= h < WORK_HOURS[1]:
             try:
                 once()
+                errors = 0
             except Exception as e:  # сеть или FL упали: пишем и ждем следующий круг
+                errors += 1
                 with LOG.open("a", encoding="utf-8") as f:
                     f.write(f"{dt.datetime.now(MINSK):%Y-%m-%d %H:%M} ошибка {type(e).__name__}: {e}\n")
+            try:
+                health(errors)
+            except Exception:
+                pass
         poll(start + INTERVAL)
 
 
