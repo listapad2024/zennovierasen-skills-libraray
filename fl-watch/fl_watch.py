@@ -357,10 +357,15 @@ def once():
     seen = set(state["seen"])
     sent = set(json.loads((HERE / "sent.json").read_text())) if (HERE / "sent.json").exists() else set()
     now = dt.datetime.now(fr.MSK)
-    fr.SINCE = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=MAX_AGE_H)
+    # 31.10: заказы, вышедшие ночью (после 21:00, когда радар спит), утром резались как старые. Окно свежести
+    # = с последнего рабочего круга, но не меньше MAX_AGE_H и не больше 14 ч.
+    max_age = min(14, max(MAX_AGE_H, (time.time() - state.get("last_round", time.time())) / 3600 + 0.5))
+    fr.SINCE = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max_age)
     rates = fr.rates()
     out = {}
-    fr.fl_parse(fr.get("https://www.fl.ru/projects/?kind=1"), out, now)
+    pages = 1 if max_age <= MAX_AGE_H + 1 else 5  # после ночи одной страницы (30 заказов) мало
+    for n in range(1, pages + 1):
+        fr.fl_parse(fr.get("https://www.fl.ru/projects/?kind=1" if n == 1 else f"https://www.fl.ru/projects/page-{n}/?kind=1"), out, now)
     orders = state.setdefault("orders", {})
     queued = 0
     for v in out.values():
@@ -369,8 +374,8 @@ def once():
         seen.add(v["id"])
         if v["published"]:
             v["age_h"] = round((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(v["published"])).total_seconds() / 3600, 1)
-            if v["age_h"] > MAX_AGE_H:
-                journal(v, "не отправлен, отсеян до оценки", f"опубликован больше {MAX_AGE_H} ч назад, заказ уже не свежий")
+            if v["age_h"] > max_age:
+                journal(v, "не отправлен, отсеян до оценки", f"опубликован больше {max_age:.0f} ч назад, заказ уже не свежий")
                 continue
         if v["budget"] and v["currency"] in rates:
             v["budget_rub"] = round(v["budget"] * rates[v["currency"]])
@@ -394,6 +399,7 @@ def once():
         (TRIAGE / f"{v['id'].replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
         orders[v["id"]] = {k: keep[k] for k in ("id", "title", "url", "budget_rub", "responses")}
         queued += 1
+    state["last_round"] = time.time()
     state["seen"] = sorted(seen)[-5000:]
     state["orders"] = dict(list(orders.items())[-300:])
     STATE.write_text(json.dumps(state))
