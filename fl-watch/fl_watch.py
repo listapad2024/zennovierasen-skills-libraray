@@ -189,6 +189,22 @@ def persona_hits(v):
         return f"Persona недоступна: {type(e).__name__}"
 
 
+JOURNAL = HERE / "journal.md"  # Михаил 31.10: нарастающая история по каждому заказу, почему он ушел или не ушел в бот
+
+
+def journal(v, result, reason, analysis=""):
+    """Запись в journal.md: дата и время, заказ, ссылка, бюджет и отклики, итог, причина и разбор. Блоки через пустую строку."""
+    rub = v.get("budget_rub")
+    meta = " · ".join(x for x in (
+        f"бюджет {rub:,} ₽".replace(",", " ") if rub else "бюджет по договоренности",
+        f"откликов {v['responses']}" if v.get("responses") is not None else "",
+        f"опубликован {v['age_h']} ч назад" if v.get("age_h") is not None else "") if x)
+    parts = [f"## {dt.datetime.now(MINSK):%d.%m.%Y %H:%M} · {v.get('title') or v.get('id')}", v.get("url") or "", meta,
+             f"Итог: {result}", f"Причина: {reason}" if reason else "", f"Разбор:\n\n{analysis.strip()}" if analysis.strip() else "", "---"]
+    with JOURNAL.open("a", encoding="utf-8") as f:
+        f.write("\n\n".join(x for x in parts if x) + "\n\n")
+
+
 def sweep_triage():
     """Решения CLI-сессии (verdict/*.txt) убирают заказ в triage/done, заказы без решения дольше STALE_H часов в triage/stale."""
     if not TRIAGE.exists():
@@ -198,11 +214,24 @@ def sweep_triage():
     for f in TRIAGE.glob("*.json"):
         vd = VERDICT / (f.stem + ".txt")
         if vd.exists():
+            try:
+                v = json.loads(f.read_text(encoding="utf-8"))
+                raw = vd.read_text(encoding="utf-8", errors="replace").strip()
+                head, _, rest = raw.partition("\n")
+                ok = head.lower().startswith("ok")
+                journal(v, "отправлен в бот" if ok else "не отправлен, отсеян оценкой",
+                        head.split(":", 1)[1].strip() if ":" in head else head, rest)
+            except Exception:
+                pass
             with LOG.open("a", encoding="utf-8") as lg:  # решение с причиной остается в логе, verdict-файл удаляется
                 lg.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} verdict {f.stem}: {vd.read_text(encoding='utf-8', errors='replace').strip()[:300]}\n")
             f.replace(TRIAGE / "done" / f.name)
             vd.unlink()
         elif time.time() - f.stat().st_mtime > STALE_H * 3600:
+            try:
+                journal(json.loads(f.read_text(encoding="utf-8")), "не отправлен", f"оценка не разобрала его за {STALE_H} ч")
+            except Exception:
+                pass
             f.replace(TRIAGE / "stale" / f.name)
 
 
@@ -341,18 +370,22 @@ def once():
         if v["published"]:
             v["age_h"] = round((dt.datetime.now(dt.timezone.utc) - dt.datetime.fromisoformat(v["published"])).total_seconds() / 3600, 1)
             if v["age_h"] > MAX_AGE_H:
+                journal(v, "не отправлен, отсеян до оценки", f"опубликован больше {MAX_AGE_H} ч назад, заказ уже не свежий")
                 continue
         if v["budget"] and v["currency"] in rates:
             v["budget_rub"] = round(v["budget"] * rates[v["currency"]])
         if "серое" in score(v)[1]:
+            journal(v, "не отправлен, отсеян до оценки", ", ".join(w for w in score(v)[1] if "серое" in w), v.get("text", "")[:600])
             continue
         try:
             if fr.fl_details(v) == "taken":  # полное ТЗ и проверка, не выбран ли исполнитель
+                journal(v, "не отправлен, отсеян до оценки", "исполнитель уже выбран")
                 continue
         except OSError:
             pass
         s, why = score(v)
         if "серое" in why:
+            journal(v, "не отправлен, отсеян до оценки", ", ".join(w for w in why if "серое" in w), v.get("text", "")[:600])
             continue
         keep = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses", "age_h", "kind", "safe_deal")}
         keep["score"], keep["why"] = s, why
