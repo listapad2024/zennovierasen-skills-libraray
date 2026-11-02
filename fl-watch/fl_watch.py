@@ -244,8 +244,13 @@ def order_caption(text, o):
         short = next((l.split(":", 1)[1].strip() for l in lines if l.lower().lstrip("-* ").startswith("чем подходит:")), "")
         total = next((l.split(":", 1)[1].strip() for l in lines if l.lower().startswith("итог:")), "")
         short = " ".join(x for x in (short, f"Оценка {total}." if total else "") if x)
-    cap = "\n\n".join(x for x in (title, short, o.get("url") or "") if x)
-    return cap[:1000]
+    url = o.get("url") or next((m.group(0) for m in [re.search(r"https://www\.fl\.ru/projects/\d+\S*", text)] if m), "")
+    num = "".join(re.findall(r"\d+", str(o.get("id") or "")))
+    if not url and num:
+        url = f"https://www.fl.ru/projects/{num}/"
+    body = "\n\n".join(x for x in (title, short) if x)
+    # ссылка обязательна (Михаил 02.11): режем текст, а не ссылку
+    return (body[:1000 - len(url) - 2] + "\n\n" + url) if url else body[:1000]
 
 
 def send_group(items):
@@ -292,8 +297,9 @@ def flush_outbox():
         reply_to = None
         if text.startswith("#order="):  # оцененный Claude заказ: md-файл документом, подпись из строки «Кратко:» и ссылка
             head, _, text = text.partition("\n")
-            oid = head.split("=", 1)[1].strip()
-            o = (json.loads(STATE.read_text()).get("orders", {}).get(oid) or {}) if STATE.exists() else {}
+            raw = head.split("=", 1)[1].strip()
+            num = "".join(re.findall(r"\d+", raw))  # 02.11: Sonnet пишет id как fl_5527713 или 5527713, ключ в state fl:5527713
+            o = (json.loads(STATE.read_text()).get("orders", {}).get(f"fl:{num}") or {"id": f"fl:{num}"}) if STATE.exists() else {}
             dest = REPORTS / f.name
             dest.write_text(text.strip() + "\n", encoding="utf-8")
             orders.append((f, dest, order_caption(text, o)))
