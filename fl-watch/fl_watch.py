@@ -125,20 +125,22 @@ def tg(method, **params):
         return json.loads(r.read())
 
 
-def send(text, url=None, oid=None, reply_to=None):
+def send(text, url=None, oid=None, reply_to=None, markup=None):
     if not (os.environ.get("TG_BOT_TOKEN") and os.environ.get("TG_CHAT_ID")):
-        print(text)
-        return
+        print(text, markup or "")
+        return {}
     p = {"chat_id": os.environ["TG_CHAT_ID"], "text": text[:4000], "disable_web_page_preview": "true"}
     if url and oid:  # у каждого заказа две кнопки: ссылка на заказ и разбор с черновиком отклика
         p["reply_markup"] = {"inline_keyboard": [[{"text": "Открыть на FL.ru", "url": url},
                                                   {"text": "Сделать отчёт", "callback_data": f"r:{oid}"}]]}
+    if markup:
+        p["reply_markup"] = markup
     if reply_to:
         p["reply_to_message_id"] = reply_to
-    tg("sendMessage", **p)
+    return tg("sendMessage", **p)
 
 
-def send_doc(path, caption, reply_to=None):
+def send_doc(path, caption, reply_to=None, markup=None):
     """md-файл с вариантами отклика документом в Telegram: Михаил открывает и отправляет отклик сам (решение 28.10)."""
     tok, chat = os.environ.get("TG_BOT_TOKEN"), os.environ.get("TG_CHAT_ID")
     if not (tok and chat):
@@ -146,12 +148,14 @@ def send_doc(path, caption, reply_to=None):
         return
     b = "flwatch" + str(int(time.time() * 1000))
     parts = [("chat_id", chat), ("caption", caption[:1000])] + ([("reply_to_message_id", str(reply_to))] if reply_to else [])
+    if markup:
+        parts.append(("reply_markup", json.dumps(markup, ensure_ascii=False)))
     body = b"".join(f"--{b}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n".encode() for k, v in parts)
     body += (f"--{b}\r\nContent-Disposition: form-data; name=\"document\"; filename=\"{Path(path).name}\"\r\n"
              f"Content-Type: text/markdown\r\n\r\n").encode() + Path(path).read_bytes() + f"\r\n--{b}--\r\n".encode()
     req = urllib.request.Request(f"https://api.telegram.org/bot{tok}/sendDocument", data=body,
                                  headers={"Content-Type": f"multipart/form-data; boundary={b}"})
-    urllib.request.urlopen(req, timeout=60).read()
+    return json.loads(urllib.request.urlopen(req, timeout=60).read())
 
 
 def enqueue(oid, reply_to):
@@ -302,7 +306,7 @@ def flush_outbox():
             o = (json.loads(STATE.read_text()).get("orders", {}).get(f"fl:{num}") or {"id": f"fl:{num}"}) if STATE.exists() else {}
             dest = REPORTS / f.name
             dest.write_text(text.strip() + "\n", encoding="utf-8")
-            orders.append((f, dest, order_caption(text, o)))
+            orders.append((f, dest, order_caption(text, o), o.get("id") or f"fl:{num}"))
             continue
         if text.startswith("#reply_to="):
             head, _, text = text.partition("\n")
@@ -316,44 +320,289 @@ def flush_outbox():
     for i in range(0, len(orders), 10):
         chunk = orders[i:i + 10]
         if len(chunk) == 1:
-            fn = lambda c=chunk[0]: send_doc(c[1], c[2])
+            fn = lambda c=chunk[0]: send_doc(c[1], c[2], markup=order_keyboard([c[3]]))
         else:
-            fn = lambda c=chunk: send_group([(d, cap) for _, d, cap in c])
-        if deliver([f.name for f, _, _ in chunk], fn):
-            for f, _, _ in chunk:
+            fn = lambda c=chunk: (send_group([(d, cap) for _, d, cap, _ in c]),
+                                  send("Отметь по каждому заказу:", markup=order_keyboard([oid for *_, oid in c])))
+        if deliver([f.name for f, *_ in chunk], fn):
+            for f, *_ in chunk:
                 f.unlink()
 
 
+# --- Кнопки под заказами (Михаил 08.11) ---------------------------------------------------------------------------
+# «Откликнулся» пишет отклик в Persona (record_response). «Отклонить» спрашивает причину, есть кнопка «Без причины».
+# Без причины в базу ничего не идет, только строка в журнале. Причину разбирает LLM (CLI-сессия по QUEUE.md, сам
+# скрипт к Claude не обращается): «не сейчас» не меняет оценку будущих заказов, «не мой стек» становится правилом
+# отсева в learned_rules.md и анти-предпочтением в Persona.
+BUTTONS = HERE / "fl_buttons.json"      # ждущие причины отказа и уже отмеченные заказы
+FEEDBACK = HERE / "feedback"            # причины отказа для LLM: feedback/<имя>.json
+FEEDBACK_RES = HERE / "feedback_result" # ответ LLM: feedback_result/<имя>.json
+LEARNED = HERE / "learned_rules.md"     # правила «не мой стек», CLI-сессия читает их при оценке
+PERSONA_BASE = PERSONA_URL.rsplit("/", 1)[0]
+_tg_offset = None
+
+
+def order_keyboard(oids):
+    """Под одним заказом две кнопки; под блоком заказов строка на каждый: «✅ название» и «✖ Отклонить»."""
+    orders = _orders()
+    rows = []
+    for oid in oids:
+        name = (orders.get(oid, {}).get("title") or oid)[:28] if len(oids) > 1 else "Откликнулся"
+        rows.append([{"text": f"✅ {name}", "callback_data": f"a:{oid}"},
+                     {"text": "✖ Отклонить", "callback_data": f"x:{oid}"}])
+    return {"inline_keyboard": rows}
+
+
+def _orders():
+    try:
+        return json.loads(STATE.read_text()).get("orders", {})
+    except Exception:
+        return {}
+
+
+def _btn_state():
+    try:
+        return json.loads(BUTTONS.read_text(encoding="utf-8"))
+    except Exception:
+        return {"pending": {}, "marked": {}}
+
+
+def _btn_save(b):
+    BUTTONS.write_text(json.dumps(b, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _order_full(oid):
+    """Заказ с полным ТЗ: из state, а текст из triage/done (там полный json)."""
+    v = dict(_orders().get(oid) or {"id": oid})
+    for d in (TRIAGE / "done", TRIAGE, TRIAGE / "stale"):
+        f = d / f"{oid.replace(':', '_')}.json"
+        if f.exists():
+            try:
+                v = {**json.loads(f.read_text(encoding="utf-8")), **v}
+            except Exception:
+                pass
+            break
+    if not v.get("url"):
+        num = "".join(re.findall(r"\d+", oid))
+        v["url"] = f"https://www.fl.ru/projects/{num}/"
+    return v
+
+
+def persona_post(path, payload):
+    tok = next((l.split("=", 1)[1].strip() for l in PERSONA_ENV.read_text(encoding="utf-8").splitlines()
+                if l.split("=", 1)[0].strip().upper().endswith("TOKEN")), "")
+    req = urllib.request.Request(f"{PERSONA_BASE}/{path}", data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                 headers={"Content-Type": "application/json", "X-API-Token": tok})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(req, timeout=120) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def _log(msg):
+    with LOG.open("a", encoding="utf-8") as lg:
+        lg.write(f"{dt.datetime.now():%Y-%m-%d %H:%M} {msg}\n")
+
+
+def _mark_row(cq, oid, label):
+    """Строку с кнопками заказа заменяем отметкой, остальные строки блока не трогаем."""
+    kb = (cq["message"].get("reply_markup") or {}).get("inline_keyboard") or []
+    rows = []
+    for row in kb:
+        if any(b.get("callback_data", "")[2:] == oid for b in row):
+            title = row[0]["text"][2:] if len(kb) > 1 else ""
+            rows.append([{"text": f"{label} {title}".strip(), "callback_data": f"-:{oid}"}])
+        else:
+            rows.append(row)
+    try:
+        tg("editMessageReplyMarkup", chat_id=cq["message"]["chat"]["id"], message_id=cq["message"]["message_id"],
+           reply_markup={"inline_keyboard": rows})
+    except Exception:
+        pass
+
+
+def on_responded(cq, oid):
+    v = _order_full(oid)
+    num = "".join(re.findall(r"\d+", oid))
+    rep = REPORTS / f"fl_{num}.md"
+    try:
+        persona_post("record_response", {
+            "id": f"fl_{num}", "platform": "fl_ru", "url": v.get("url", ""), "title": v.get("title", ""),
+            "response_text": f"Отклик отправлен Михаилом на FL.ru. Черновики вариантов: {rep.name if rep.exists() else 'нет'}.",
+            "commentary": "Отмечено кнопкой «Откликнулся» в боте радара.",
+            "budget_in_field": v.get("budget_rub"), "task_description": (v.get("text") or "")[:4000],
+            "verdict_at_send": "candidate", "outcome": "pending", "sent_by": "manual", "reindex": True})
+        saved = True
+    except Exception as e:
+        saved = False
+        _log(f"ОШИБКА записи отклика {oid} в Persona: {type(e).__name__}")
+    b = _btn_state()
+    b["marked"][oid] = {"result": "responded", "at": time.time()}
+    _btn_save(b)
+    journal(v, "Михаил откликнулся", "кнопка «Откликнулся»")
+    _log(f"кнопка: откликнулся {oid}" + ("" if saved else " (Persona недоступна, запись только в журнале)"))
+    _mark_row(cq, oid, "✅ Откликнулся")
+    return "Записал отклик" if saved else "Persona недоступна, записал только в журнал"
+
+
+def on_reject(cq, oid):
+    v = _orders().get(oid) or {}
+    r = send(f"Почему отклоняешь «{(v.get('title') or oid)[:80]}»?\n\nНапиши причину ответом на это сообщение. "
+             f"Например: «не хочу сейчас, занят» или «вообще не мой стек».",
+             reply_to=cq["message"]["message_id"],
+             markup={"inline_keyboard": [[{"text": "Без причины", "callback_data": f"n:{oid}"}]]})
+    b = _btn_state()
+    mid = str((r.get("result") or {}).get("message_id", ""))
+    b["pending"][mid] = {"oid": oid, "src_msg": cq["message"]["message_id"], "at": time.time()}
+    _btn_save(b)
+    _mark_row(cq, oid, "✖ Отклонено")
+    return "Жду причину"
+
+
+def on_no_reason(cq, oid):
+    b = _btn_state()
+    b["pending"].pop(str(cq["message"]["message_id"]), None)
+    b["marked"][oid] = {"result": "rejected", "at": time.time()}
+    _btn_save(b)
+    journal(_order_full(oid), "Михаил отклонил", "без причины, в базу не пишем")
+    _log(f"кнопка: отклонен без причины {oid}")
+    try:
+        tg("editMessageText", chat_id=cq["message"]["chat"]["id"], message_id=cq["message"]["message_id"],
+           text="Отклонено без причины, в базу не записываю.")
+    except Exception:
+        pass
+    return "Отклонено"
+
+
+def on_reason(msg):
+    """Текст Михаила: ответ на вопрос о причине или, если вопрос один, просто следующее сообщение."""
+    b = _btn_state()
+    b["pending"] = {k: p for k, p in b["pending"].items() if time.time() - p.get("at", 0) < 24 * 3600}
+    reply = str((msg.get("reply_to_message") or {}).get("message_id", ""))
+    key = reply if reply in b["pending"] else (next(iter(b["pending"])) if len(b["pending"]) == 1 else None)
+    if not key:
+        return
+    p = b["pending"].pop(key)
+    oid = p["oid"]
+    b["marked"][oid] = {"result": "rejected", "reason": msg["text"], "at": time.time()}
+    _btn_save(b)
+    v = _order_full(oid)
+    FEEDBACK.mkdir(exist_ok=True)
+    keep = {k: v.get(k) for k in ("id", "title", "text", "url", "budget_rub", "responses")}
+    keep.update(reason=msg["text"], reason_at=dt.datetime.now(MINSK).isoformat(timespec="seconds"), reply_to=msg["message_id"])
+    (FEEDBACK / f"{oid.replace(':', '_')}.json").write_text(json.dumps(keep, ensure_ascii=False, indent=1), encoding="utf-8")
+    _log(f"кнопка: отклонен {oid}, причина на разбор: {msg['text'][:200]}")
+    send("Принял. Разберу причину и запишу в базу, напишу, что понял.", reply_to=msg["message_id"])
+
+
+KIND_RU = {"not_now": "не сейчас", "not_stack": "не мой стек", "budget": "не устроил бюджет",
+           "client": "не устроил заказчик или ТЗ", "other": "другое"}
+
+
+def apply_feedback():
+    """Разбор причины от LLM (feedback_result/*.json) пишем в Persona и, для «не мой стек», в learned_rules.md."""
+    if not FEEDBACK_RES.exists():
+        return
+    for f in FEEDBACK_RES.glob("*.json"):
+        src = FEEDBACK / f.name
+        try:
+            res = json.loads(f.read_text(encoding="utf-8"))
+            v = json.loads(src.read_text(encoding="utf-8")) if src.exists() else {"id": f.stem.replace("_", ":", 1)}
+        except Exception as e:
+            _log(f"ОШИБКА разбора причины {f.name}: {type(e).__name__}")
+            f.replace(f.with_suffix(".bad"))
+            continue
+        kind = res.get("kind") if res.get("kind") in KIND_RU else "other"
+        summary, rule = (res.get("summary") or "").strip(), (res.get("rule") or "").strip()
+        title = v.get("title") or v.get("id")
+        if kind == "not_stack":
+            text = f"Михаил не берет такие заказы на фрилансе: {rule or summary}. Пример: «{title}». Его слова: {v.get('reason')}"
+            tags, category = ["fl_decline", "not_stack", "anti_preference"], "skill"
+        elif kind == "not_now":
+            text = (f"Михаил пропустил заказ «{title}» только по времени ({summary}). Тип заказа ему подходит, "
+                    f"на оценку похожих заказов это не влияет. Его слова: {v.get('reason')}")
+            tags, category = ["fl_decline", "not_now"], "fact"
+        else:
+            text = f"Михаил отказался от заказа «{title}» ({KIND_RU[kind]}): {summary}. Его слова: {v.get('reason')}"
+            tags, category = ["fl_decline", kind], "fact"
+        try:
+            persona_post("remember", {"text": text, "category": category, "source": "fl_radar_decline", "tags": tags,
+                                      "platform": "fl_ru", "extra_payload": {"order_id": v.get("id"), "url": v.get("url"), "kind": kind}})
+            saved = True
+        except Exception as e:
+            saved = False
+            _log(f"ОШИБКА записи причины {f.stem} в Persona: {type(e).__name__}")
+        if kind == "not_stack" and rule:
+            if not LEARNED.exists():
+                LEARNED.write_text("# Чему научили отказы Михаила (не мой стек)\n\nТакие заказы отсеивай (`skip`), "
+                                   "даже если они похожи на стек.\n\n", encoding="utf-8")
+            with LEARNED.open("a", encoding="utf-8") as lf:
+                lf.write(f"- {rule} (пример: {title}, {dt.datetime.now(MINSK):%d.%m.%Y})\n")
+        journal(v, "Михаил отклонил", f"{KIND_RU[kind]}: {v.get('reason')}", summary)
+        _log(f"причина {f.stem}: {kind} {summary[:150]}")
+        after = {"not_stack": f"Такие заказы дальше буду отсеивать: {rule or summary}.",
+                 "not_now": "Тип заказа тебе подходит, на будущие оценки это не влияет."}.get(kind, "На отсев будущих заказов это не влияет.")
+        send(f"Понял причину как «{KIND_RU[kind]}». {after}" + ("" if saved else "\n\nPersona недоступна, записал только в журнал."),
+             reply_to=v.get("reply_to"))
+        (FEEDBACK / "done").mkdir(parents=True, exist_ok=True)
+        if src.exists():
+            src.replace(FEEDBACK / "done" / src.name)
+        f.unlink()
+
+
+def handle_update(u):
+    chat = str(os.environ.get("TG_CHAT_ID"))
+    cq = u.get("callback_query")
+    if cq:
+        if str(cq["message"]["chat"]["id"]) != chat:
+            return  # чужие чаты не обслуживаем
+        data = cq.get("data", "")
+        kind, oid = data[:1], data[2:]
+        if kind == "r":
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Ставлю в очередь")
+            try:
+                enqueue(oid, cq["message"]["message_id"])
+            except Exception as e:
+                send(f"Отчёт не собрался: {type(e).__name__}", reply_to=cq["message"]["message_id"])
+            return
+        fn = {"a": on_responded, "x": on_reject, "n": on_no_reason}.get(kind)
+        text = "Уже отмечено" if kind == "-" else ""
+        if fn:
+            try:
+                text = fn(cq, oid)
+            except Exception as e:
+                text = f"Ошибка: {type(e).__name__}"
+                _log(f"ОШИБКА кнопки {data}: {type(e).__name__} {e}")
+        tg("answerCallbackQuery", callback_query_id=cq["id"], text=text)
+        return
+    msg = u.get("message")
+    if msg and msg.get("text") and str(msg["chat"]["id"]) == chat and not msg["text"].startswith("/"):
+        on_reason(msg)
+
+
 def poll(until):
-    """До следующего прохода ленты слушаем нажатия кнопок «Сделать отчёт»."""
+    """До следующего прохода ленты слушаем кнопки под заказами и ответы Михаила с причиной отказа."""
+    global _tg_offset
     if not os.environ.get("TG_BOT_TOKEN"):
         time.sleep(max(0, until - time.time()))
         return
-    off = None
     while time.time() < until:
-        try:
-            sweep_triage()
-            flush_outbox()
-        except Exception:
-            pass
+        for step in (sweep_triage, flush_outbox, apply_feedback):
+            try:
+                step()
+            except Exception:
+                pass
         try:
             upd = tg("getUpdates", timeout=min(20, max(1, int(until - time.time()))),
-                     allowed_updates=["callback_query"], **({"offset": off} if off else {}))
+                     allowed_updates=["callback_query", "message"], **({"offset": _tg_offset} if _tg_offset else {}))
         except Exception:  # сеть или 409 от другого читателя бота: ждем и пробуем снова
             time.sleep(10)
             continue
         for u in upd.get("result", []):
-            off = u["update_id"] + 1
-            cq = u.get("callback_query")
-            if not cq or not cq.get("data", "").startswith("r:"):
-                continue
-            if str(cq["message"]["chat"]["id"]) != str(os.environ.get("TG_CHAT_ID")):
-                continue  # чужие чаты не обслуживаем
-            tg("answerCallbackQuery", callback_query_id=cq["id"], text="Ставлю в очередь")
+            _tg_offset = u["update_id"] + 1
             try:
-                enqueue(cq["data"][2:], cq["message"]["message_id"])
+                handle_update(u)
             except Exception as e:
-                send(f"Отчёт не собрался: {type(e).__name__}", reply_to=cq["message"]["message_id"])
+                _log(f"ОШИБКА обработки обновления: {type(e).__name__} {e}")
 
 
 def once():
