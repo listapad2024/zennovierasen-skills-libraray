@@ -2,8 +2,8 @@
 rem ASCII only: Cyrillic in a .cmd under chcp 65001 shifts cmd's line offsets
 cd /d D:\Codex\fl_watch
 C:\Python313\python.exe fl_watch.py --check
-rem run Claude only if triage has a json without a verdict
-powershell -NoProfile -Command "if (Get-ChildItem 'triage' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path ('verdict\' + $_.BaseName + '.txt')) }) { exit 0 } else { exit 1 }"
+rem run Claude only if triage has a json without a verdict or feedback has a reason without a result
+powershell -NoProfile -Command "if ((Get-ChildItem 'triage' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path ('verdict\' + $_.BaseName + '.txt')) }) -or (Get-ChildItem 'feedback' -Filter *.json -ErrorAction SilentlyContinue | Where-Object { -not (Test-Path ('feedback_result\' + $_.Name)) })) { exit 0 } else { exit 1 }"
 if errorlevel 1 exit /b 0
 rem proxy for the API, taken from settings.json even if that file is broken
 for /f "usebackq delims=" %%p in (`C:\Python313\python.exe get_proxy.py`) do set "HTTPS_PROXY=%%p"
