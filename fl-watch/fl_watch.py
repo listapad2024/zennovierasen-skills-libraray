@@ -442,7 +442,7 @@ def on_responded(cq, oid):
     _log(f"кнопка: откликнулся {oid}" + ("" if saved else " (Persona недоступна, запись только в журнале)"))
     _mark_row(cq, oid, "📨 Отклик отправлен ·")
     resp_save(oid, sent_at=dt.datetime.now(MINSK).isoformat(timespec="seconds"), outcome="pending")
-    ask_sent_text(oid, cq["message"]["message_id"])
+    # Михаил 09.11: текст отклика и ответы заказчика не спрашиваем в боте, их забираем из кабинета FL.ru (my-offers)
     return "Записал отклик" if saved else "Persona недоступна, записал только в журнал"
 
 
