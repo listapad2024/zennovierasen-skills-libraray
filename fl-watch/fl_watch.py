@@ -410,7 +410,7 @@ def _mark_row(cq, oid, label):
     for row in kb:
         if any(b.get("callback_data", "")[2:] == oid for b in row):
             title = row[0]["text"][2:] if len(kb) > 1 else ""
-            rows.append([{"text": f"{label} {title}".strip(), "callback_data": f"-:{oid}"}])
+            rows.append([{"text": f"{label} {title}".strip(" ·"), "callback_data": f"-:{oid}"}])
         else:
             rows.append(row)
     try:
@@ -440,7 +440,7 @@ def on_responded(cq, oid):
     _btn_save(b)
     journal(v, "Михаил откликнулся", "кнопка «Откликнулся»")
     _log(f"кнопка: откликнулся {oid}" + ("" if saved else " (Persona недоступна, запись только в журнале)"))
-    _mark_row(cq, oid, "✅ Откликнулся")
+    _mark_row(cq, oid, "📨 Отклик отправлен ·")
     return "Записал отклик" if saved else "Persona недоступна, записал только в журнал"
 
 
@@ -454,7 +454,7 @@ def on_reject(cq, oid):
     mid = str((r.get("result") or {}).get("message_id", ""))
     b["pending"][mid] = {"oid": oid, "src_msg": cq["message"]["message_id"], "at": time.time()}
     _btn_save(b)
-    _mark_row(cq, oid, "✖ Отклонено")
+    _mark_row(cq, oid, "🚫 Отклонено ·")
     return "Жду причину"
 
 
