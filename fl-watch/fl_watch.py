@@ -583,15 +583,15 @@ def resp_save(oid, **kw):
 
 
 def draft_variants(oid):
-    """Тексты «## Вариант N» из md радара, без строки «Поля: ...»."""
+    """Тексты отклика из md радара без строки «Поля: ...»: «## Вариант N» или, с 09.11, один «## Отклик» (ключ "1")."""
     num = "".join(re.findall(r"\d+", oid))
     f = REPORTS / f"fl_{num}.md"
     if not f.exists():
         return {}
     out = {}
-    for m in re.finditer(r"^## Вариант (\d)[^\n]*\n(.*?)(?=^## |\Z)", f.read_text(encoding="utf-8"), re.S | re.M):
+    for m in re.finditer(r"^## (?:Вариант (\d)|Отклик)[^\n]*\n(.*?)(?=^## |\Z)", f.read_text(encoding="utf-8"), re.S | re.M):
         body = "\n".join(l for l in m.group(2).strip().splitlines() if not l.strip().lower().startswith("поля:"))
-        out[m.group(1)] = re.sub(r"\n{3,}", "\n\n", body).strip()
+        out[m.group(1) or "1"] = re.sub(r"\n{3,}", "\n\n", body).strip()
     return out
 
 
@@ -614,7 +614,7 @@ def resp_to_persona(r):
 
 def ask_sent_text(oid, reply_to):
     vs = sorted(draft_variants(oid))
-    row = [{"text": f"Вариант {n}", "callback_data": f"s:{n}:{oid}"} for n in vs]
+    row = [{"text": "Как в черновике" if len(vs) == 1 else f"Вариант {n}", "callback_data": f"s:{n}:{oid}"} for n in vs]
     kb = ([row] if row else []) + [[{"text": "✍️ Свой текст", "callback_data": f"s:own:{oid}"},
                                     {"text": "Пропустить", "callback_data": f"s:skip:{oid}"}]]
     send("Какой текст ушел заказчику? Если правил вариант, нажми «Свой текст» и пришли то, что отправил.",
@@ -653,10 +653,10 @@ def on_sent_choice(cq, oid, choice):
         return "Жду текст"
     r = resp_load(oid)
     text = (r.get("drafts") or {}).get(choice) or draft_variants(oid).get(choice, "")
-    r = resp_save(oid, sent_text=text, sent_source=f"вариант {choice} радара без правок")
+    r = resp_save(oid, sent_text=text, sent_source=f"черновик радара {choice} без правок")
     ok = resp_to_persona(r)
     _log(f"отклик {oid}: ушел вариант {choice}")
-    _edit(cq, f"Сохранил: ушел вариант {choice} без правок." + ("" if ok else " Persona недоступна, сохранил локально.")
+    _edit(cq, "Сохранил: ушел черновик радара без правок." + ("" if ok else " Persona недоступна, сохранил локально.")
           + "\n\nКогда будет ответ или исход, отметь здесь:", outcome_keyboard(oid))
     return "Сохранил"
 
