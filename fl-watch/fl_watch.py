@@ -441,6 +441,8 @@ def on_responded(cq, oid):
     journal(v, "Михаил откликнулся", "кнопка «Откликнулся»")
     _log(f"кнопка: откликнулся {oid}" + ("" if saved else " (Persona недоступна, запись только в журнале)"))
     _mark_row(cq, oid, "📨 Отклик отправлен ·")
+    resp_save(oid, sent_at=dt.datetime.now(MINSK).isoformat(timespec="seconds"), outcome="pending")
+    ask_sent_text(oid, cq["message"]["message_id"])
     return "Записал отклик" if saved else "Persona недоступна, записал только в журнал"
 
 
@@ -483,6 +485,9 @@ def on_reason(msg):
         return
     p = b["pending"].pop(key)
     oid = p["oid"]
+    if p.get("kind") in ("sent_text", "reply"):
+        _btn_save(b)
+        return on_text_for_response(p, msg, key)
     b["marked"][oid] = {"result": "rejected", "reason": msg["text"], "at": time.time()}
     _btn_save(b)
     v = _order_full(oid)
@@ -548,6 +553,145 @@ def apply_feedback():
             src.replace(FEEDBACK / "done" / src.name)
         f.unlink()
 
+# --- Что реально ушло и чем кончилось (Михаил 09.11) ---------------------------------------------------------------
+# Цель Михаила: со временем доверить радару отклики без вычитки. Для этого копим пары «черновик радара -> текст,
+# который Михаил реально отправил» и что ответил заказчик. responses/<имя>.json хранит все локально, Persona
+# получает отправленный текст и исход (record_response идемпотентен по id: answered/won дают буст в поиске).
+RESPONSES = HERE / "responses"
+
+
+def _resp_path(oid):
+    return RESPONSES / f"{oid.replace(':', '_')}.json"
+
+
+def resp_load(oid):
+    try:
+        return json.loads(_resp_path(oid).read_text(encoding="utf-8"))
+    except Exception:
+        v = _order_full(oid)
+        r = {k: v.get(k) for k in ("id", "title", "url", "budget_rub", "responses")}
+        r.update(task=(v.get("text") or "")[:6000], drafts=draft_variants(oid), sent_text="", sent_source="", replies=[], outcome="pending")
+        return r
+
+
+def resp_save(oid, **kw):
+    r = resp_load(oid)
+    r.update(kw)
+    RESPONSES.mkdir(exist_ok=True)
+    _resp_path(oid).write_text(json.dumps(r, ensure_ascii=False, indent=1), encoding="utf-8")
+    return r
+
+
+def draft_variants(oid):
+    """Тексты «## Вариант N» из md радара, без строки «Поля: ...»."""
+    num = "".join(re.findall(r"\d+", oid))
+    f = REPORTS / f"fl_{num}.md"
+    if not f.exists():
+        return {}
+    out = {}
+    for m in re.finditer(r"^## Вариант (\d)[^\n]*\n(.*?)(?=^## |\Z)", f.read_text(encoding="utf-8"), re.S | re.M):
+        body = "\n".join(l for l in m.group(2).strip().splitlines() if not l.strip().lower().startswith("поля:"))
+        out[m.group(1)] = re.sub(r"\n{3,}", "\n\n", body).strip()
+    return out
+
+
+def resp_to_persona(r):
+    num = "".join(re.findall(r"\d+", str(r.get("id"))))
+    replies = "\n\n".join(f"[{x.get('at', '')}] {x.get('text', '')}" for x in r.get("replies", []))
+    try:
+        persona_post("record_response", {
+            "id": f"fl_{num}", "platform": "fl_ru", "url": r.get("url") or "", "title": r.get("title") or "",
+            "response_text": r.get("sent_text") or "(текст не сохранен)",
+            "commentary": "\n\n".join(x for x in (f"Источник текста: {r.get('sent_source') or 'неизвестно'}.",
+                                                   f"Ответы заказчика:\n{replies}" if replies else "") if x),
+            "budget_in_field": r.get("budget_rub"), "task_description": (r.get("task") or "")[:4000],
+            "verdict_at_send": "candidate", "outcome": r.get("outcome") or "pending", "sent_by": "manual", "reindex": True})
+        return True
+    except Exception as e:
+        _log(f"ОШИБКА записи отклика {r.get('id')} в Persona: {type(e).__name__}")
+        return False
+
+
+def ask_sent_text(oid, reply_to):
+    vs = sorted(draft_variants(oid))
+    row = [{"text": f"Вариант {n}", "callback_data": f"s:{n}:{oid}"} for n in vs]
+    kb = ([row] if row else []) + [[{"text": "✍️ Свой текст", "callback_data": f"s:own:{oid}"},
+                                    {"text": "Пропустить", "callback_data": f"s:skip:{oid}"}]]
+    send("Какой текст ушел заказчику? Если правил вариант, нажми «Свой текст» и пришли то, что отправил.",
+         reply_to=reply_to, markup={"inline_keyboard": kb})
+
+
+def outcome_keyboard(oid):
+    return {"inline_keyboard": [[{"text": "💬 Заказчик ответил", "callback_data": f"o:reply:{oid}"}],
+                                [{"text": "🏆 Взял заказ", "callback_data": f"o:won:{oid}"},
+                                 {"text": "Выбрали другого", "callback_data": f"o:lost:{oid}"}]]}
+
+
+def _edit(cq, text, markup=None):
+    try:
+        p = {"chat_id": cq["message"]["chat"]["id"], "message_id": cq["message"]["message_id"], "text": text}
+        if markup:
+            p["reply_markup"] = markup
+        tg("editMessageText", **p)
+    except Exception:
+        pass
+
+
+def _wait_text(cq, oid, kind, question):
+    r = send(question, reply_to=cq["message"]["message_id"])
+    b = _btn_state()
+    b["pending"][str((r.get("result") or {}).get("message_id", ""))] = {"oid": oid, "kind": kind, "src_msg": cq["message"]["message_id"], "at": time.time()}
+    _btn_save(b)
+
+
+def on_sent_choice(cq, oid, choice):
+    if choice == "skip":
+        _edit(cq, "Текст отклика не сохранен. Исход можно отметить позже.", outcome_keyboard(oid))
+        return "Ок"
+    if choice == "own":
+        _wait_text(cq, oid, "sent_text", "Пришли ответом на это сообщение текст, который ушел заказчику.")
+        return "Жду текст"
+    r = resp_load(oid)
+    text = (r.get("drafts") or {}).get(choice) or draft_variants(oid).get(choice, "")
+    r = resp_save(oid, sent_text=text, sent_source=f"вариант {choice} радара без правок")
+    ok = resp_to_persona(r)
+    _log(f"отклик {oid}: ушел вариант {choice}")
+    _edit(cq, f"Сохранил: ушел вариант {choice} без правок." + ("" if ok else " Persona недоступна, сохранил локально.")
+          + "\n\nКогда будет ответ или исход, отметь здесь:", outcome_keyboard(oid))
+    return "Сохранил"
+
+
+def on_outcome(cq, oid, choice):
+    if choice == "reply":
+        _wait_text(cq, oid, "reply", "Пришли ответом на это сообщение, что написал заказчик. Можно несколько сообщений, каждое ответом сюда.")
+        return "Жду ответ заказчика"
+    r = resp_save(oid, outcome=choice, outcome_at=dt.datetime.now(MINSK).isoformat(timespec="seconds"))
+    resp_to_persona(r)
+    journal(_order_full(oid), "Михаил взял заказ" if choice == "won" else "выбрали другого исполнителя", "отметка в боте")
+    _log(f"отклик {oid}: исход {choice}")
+    _edit(cq, "🏆 Заказ твой, записал." if choice == "won" else "Записал: выбрали другого.")
+    return "Записал"
+
+
+def on_text_for_response(p, msg, key):
+    oid, now = p["oid"], dt.datetime.now(MINSK).isoformat(timespec="seconds")
+    r = resp_load(oid)
+    if p["kind"] == "sent_text":
+        r = resp_save(oid, sent_text=msg["text"], sent_source="текст Михаила (свой или правленый вариант)")
+        note = "Сохранил текст отклика."
+    else:
+        r["replies"].append({"at": now, "text": msg["text"]})
+        r = resp_save(oid, replies=r["replies"], outcome="answered" if r.get("outcome") == "pending" else r.get("outcome"))
+        note = "Сохранил ответ заказчика."
+        b = _btn_state()  # следующие ответы заказчика тоже можно присылать ответом на тот же вопрос
+        b["pending"][key] = {**p, "at": time.time()}
+        _btn_save(b)
+    ok = resp_to_persona(r)
+    _log(f"отклик {oid}: {'текст' if p['kind'] == 'sent_text' else 'ответ заказчика'} сохранен")
+    send(note + ("" if ok else " Persona недоступна, сохранил локально.") + "\n\nДальше отметь здесь:",
+         reply_to=msg["message_id"], markup=outcome_keyboard(oid))
+
+
 
 def handle_update(u):
     chat = str(os.environ.get("TG_CHAT_ID"))
@@ -563,6 +707,15 @@ def handle_update(u):
                 enqueue(oid, cq["message"]["message_id"])
             except Exception as e:
                 send(f"Отчёт не собрался: {type(e).__name__}", reply_to=cq["message"]["message_id"])
+            return
+        if kind in ("s", "o"):  # s:<1|2|3|own|skip>:<oid> какой текст ушел, o:<reply|won|lost>:<oid> что дальше
+            _, choice, oid = data.split(":", 2)
+            try:
+                text = (on_sent_choice if kind == "s" else on_outcome)(cq, oid, choice)
+            except Exception as e:
+                text = f"Ошибка: {type(e).__name__}"
+                _log(f"ОШИБКА кнопки {data}: {type(e).__name__} {e}")
+            tg("answerCallbackQuery", callback_query_id=cq["id"], text=text)
             return
         fn = {"a": on_responded, "x": on_reject, "n": on_no_reason}.get(kind)
         text = "Уже отмечено" if kind == "-" else ""
